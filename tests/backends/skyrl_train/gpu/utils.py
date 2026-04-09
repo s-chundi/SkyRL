@@ -585,6 +585,7 @@ class InferenceEngineState:
                 proxy_url=proxy_url,
                 server_urls=server_urls,
                 model_name=served_model_name if served_model_name else cfg.trainer.policy.model.path,
+                enable_return_routed_experts=ie_cfg.enable_return_routed_experts,
                 active_lora_name=active_lora_name,
                 tokenizer=get_tokenizer(cfg.trainer.policy.model.path),
             )
@@ -683,9 +684,6 @@ def init_remote_inference_servers(
             # when we refactor the inference backend to use remote inference engines as a default, revisit this
             "--distributed-executor-backend",
             "ray",
-            # vLLM 0.13+ V1 engine spawns worker processes that can't inherit CUDA context
-            # when CUDA_VISIBLE_DEVICES is set. Disable frontend multiprocessing to fix this.
-            "--disable-frontend-multiprocessing",
             "--dtype",
             "bfloat16",
             "--host",
