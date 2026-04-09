@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
-
+import debugpy
 import numpy as np
 import ray
 import torch
@@ -210,6 +210,11 @@ class RayPPOTrainer:
                 with Timer("step", self.all_timings):
                     # for colocate_all=true, inference engine is always on GPU when starting the training step
 
+                    # debugpy.listen(("0.0.0.0", 5678))
+                    # print("Waiting for debugger on port 5678...")
+                    # debugpy.wait_for_client()
+                    # debugpy.breakpoint()
+                    
                     # 0. truncate data to have even shards
                     rand_prompts = self._remove_tail_data(rand_prompts)
                     generator_input, uids = prepare_generator_input(
