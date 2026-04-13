@@ -1,9 +1,9 @@
 """
-Multimodal render, renderer, and sample tests for the new inference path.
+VLM integration tests for the new inference path and tinker renderer.
 
 Tests /v1/chat/completions/render with a VLM to verify multimodal
-inputs are correctly tokenized and multimodal features are returned.
-Exercises VLLMRenderer end-to-end.
+inputs are correctly tokenized and multimodal features are returned,
+and exercises VLLMRenderer end-to-end.
 Tests sample() with multimodal Tinker prompts end-to-end.
 
 Requires a local vLLM install with /v1/chat/completions/render support.
