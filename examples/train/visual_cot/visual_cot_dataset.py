@@ -86,19 +86,8 @@ def make_map_fn(split, images_dir):
         image = Image.open(image_path).convert("RGB")
 
         prompt = [
-            {
-                "role": "system",
-                "content": [
-                    {"type": "text", "text": BBOX_TASK},
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "index": 0},
-                    {"type": "text", "text": example["question"]},
-                ],
-            },
+            {"role": "system", "content": BBOX_TASK},
+            {"role": "user", "content": "<image>\n" + example["question"]},
         ]
         reward_spec = {
             "method": "rule",
@@ -113,7 +102,7 @@ def make_map_fn(split, images_dir):
         }
         data = {
             "data_source": DATA_SOURCE,
-            "prompt": json.dumps(prompt),
+            "prompt": prompt,
             "images": [image],
             "env_class": "visual_cot",
             "reward_spec": json.dumps(reward_spec),

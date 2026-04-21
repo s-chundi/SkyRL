@@ -6,11 +6,13 @@ from loguru import logger
 from transformers import PreTrainedTokenizerBase
 
 
-def _prompt_not_too_long(doc, tokenizer, prompt_key, max_length):
+def _prompt_not_too_long(doc, tokenizer, prompt_key, max_length, image_token_estimate=0):
     tokens = tokenizer.apply_chat_template(
         doc[prompt_key], add_generation_prompt=True, return_dict=False, tokenize=True
     )
-    return len(tokens) <= max_length
+    num_images = len(doc.get("images", []) or [])
+    estimated_length = len(tokens) + num_images * image_token_estimate
+    return estimated_length <= max_length
 
 
 class PromptDataset:
@@ -22,12 +24,14 @@ class PromptDataset:
         num_workers: int = 8,
         prompt_key: str = "prompt",
         env_class_key: str = "env_class",
+        image_token_estimate: int = 0,
     ):
         self.tokenizer = tokenizer
         self.max_prompt_length = max_prompt_length
         self.prompt_key = prompt_key
         self.env_class_key = env_class_key
         self.num_workers = num_workers
+        self.image_token_estimate = image_token_estimate
 
         self.datasets = datasets
         if isinstance(self.datasets, str):
@@ -76,6 +80,7 @@ class PromptDataset:
                 "tokenizer": self.tokenizer,
                 "prompt_key": self.prompt_key,
                 "max_length": self.max_prompt_length,
+                "image_token_estimate": self.image_token_estimate,
             },
             num_proc=self.num_workers,
             desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",

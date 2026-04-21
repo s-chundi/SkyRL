@@ -239,6 +239,23 @@ def calculate_per_dataset_metrics(
     return eval_metrics
 
 
+def _json_default(obj: Any) -> str:
+    # Fallback for objects json cannot serialize (e.g. PIL images in multimodal env_extras).
+    cls = obj.__class__.__name__
+    return f"<non-serializable: {cls}>"
+
+
+def _json_safe(value: Any) -> Any:
+    # Strip bulky / non-serializable entries (like PIL images) from env_extras before dumping.
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    return _json_default(value)
+
+
 def dump_per_dataset_eval_results(
     dump_dir_path: Path,
     tokenizer: AutoTokenizer,
@@ -276,10 +293,10 @@ def dump_per_dataset_eval_results(
                     "score": concat_generator_outputs["rewards"][i],
                     "stop_reason": concat_generator_outputs.get("stop_reasons", [None] * len(input_prompts))[i],
                     "env_class": concat_all_envs[i],
-                    "env_extras": concat_env_extras[i],
+                    "env_extras": _json_safe(concat_env_extras[i]),
                     "data_source": data_source,
                 }
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                f.write(json.dumps(entry, ensure_ascii=False, default=_json_default) + "\n")
 
         logger.info(f"Dumped eval data for {data_source} to {filename}")
 
