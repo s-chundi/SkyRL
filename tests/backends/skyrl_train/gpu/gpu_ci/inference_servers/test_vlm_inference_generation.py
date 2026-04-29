@@ -1,10 +1,11 @@
 """
 VLM integration tests for the new inference path and tinker renderer.
 
-Tests /v1/chat/completions/render with a VLM to verify multimodal
-inputs are correctly tokenized and multimodal features are returned,
-and exercises VLLMRenderer end-to-end.
-Tests sample() with multimodal Tinker prompts end-to-end.
+
+Tests:
+    - vllm /v1/chat/completions/render with a VLM to verify multimodal inputs
+    - sample() with multimodal Tinker prompts end-to-end
+    - VLLMRenderer end-to-end
 
 Requires a local vLLM install with /v1/chat/completions/render support.
 
@@ -155,11 +156,6 @@ async def test_render_chat_completion_multimodal(module_scoped_ray_init_fixture)
         assert isinstance(placeholder["length"], int)
         assert placeholder["length"] > 0
         assert placeholder["offset"] + placeholder["length"] <= len(token_ids)
-
-
-# ---------------------------------------------------------------------------
-# sample() with multimodal tests
-# ---------------------------------------------------------------------------
 
 
 @requires_local_vllm

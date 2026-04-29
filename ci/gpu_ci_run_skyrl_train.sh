@@ -2,13 +2,12 @@
 set -xeuo pipefail
 
 export CI=true
-export _SKYRL_USE_NEW_INFERENCE=1
 # Prepare datasets used in tests.
 uv run examples/train/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
 uv run examples/train/search/searchr1_dataset.py --local_dir $HOME/data/searchR1 --split test
 
 # Run all non-megatron tests
-uv run --directory . --isolated --extra dev --extra fsdp pytest -s tests/backends/skyrl_train/gpu/gpu_ci -m "not (integrations or megatron)"
+uv run --directory . --isolated --extra dev --extra fsdp pytest -s tests/backends/skyrl_train/gpu/gpu_ci -m "not (integrations or megatron)" --ignore=tests/backends/skyrl_train/gpu/gpu_ci/megatron
 
 ## TODO: enable integrations
 # # Run tests for "integrations" folder

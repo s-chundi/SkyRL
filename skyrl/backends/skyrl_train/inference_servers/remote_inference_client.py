@@ -69,6 +69,7 @@ import aiohttp
 from skyrl.backends.skyrl_train.inference_engines.base import (
     InferenceEngineInput,
     InferenceEngineOutput,
+    MMPlaceholderRangeInfo,
     MultiModalFeatures,
 )
 from skyrl.env_vars import (
@@ -459,7 +460,7 @@ class RemoteInferenceClient:
         self,
         prompt: Dict[str, Any],
         session_id: Optional[str],
-    ) -> Tuple[List[int], Optional[Dict[str, Any]]]:
+    ) -> Tuple[List[int], Optional[MultiModalFeatures]]:
         """Build token_ids and optional multi-modal features from a Tinker prompt.
 
         For text-only prompts this simply flattens chunk tokens (no HTTP call).
@@ -472,7 +473,7 @@ class RemoteInferenceClient:
         """
         chunks = prompt.get("chunks", [])
 
-        # Fast path: no images → flatten text tokens directly.
+        # No images → flatten text tokens directly.
         image_chunks = [c for c in chunks if c.get("type") in ("image", "image_asset_pointer")]
         if not image_chunks:
             token_ids = [tok for c in chunks for tok in c.get("tokens", [])]
@@ -512,9 +513,14 @@ class RemoteInferenceClient:
             offset, length = ph["offset"], ph["length"]
             placeholder_token_slices.append(render_token_ids[offset : offset + length])
 
+        if len(placeholder_token_slices) != len(image_chunks):
+            raise ValueError(
+                f"Expected {len(image_chunks)} placeholder token slices, got {len(placeholder_token_slices)}"
+            )
+
         # Splice: walk chunks in order, substituting image placeholder tokens.
         final_token_ids: List[int] = []
-        new_placeholders: List[Dict[str, int]] = []
+        new_placeholders: List[MMPlaceholderRangeInfo] = []
         img_idx = 0
 
         for c in chunks:
@@ -527,13 +533,12 @@ class RemoteInferenceClient:
                 final_token_ids.extend(ph_tokens)
                 img_idx += 1
 
-        adjusted_features: Dict[str, Any] = {
+        # No need to decode, vllm handles decoding
+        adjusted_features: MultiModalFeatures = {
             "mm_hashes": features.get("mm_hashes", {}),
             "mm_placeholders": {"image": new_placeholders},
+            "kwargs_data": features.get("kwargs_data"),
         }
-        # No need to decode, vllm handles decoding
-        if features.get("kwargs_data") is not None:
-            adjusted_features["kwargs_data"] = features["kwargs_data"]
 
         return final_token_ids, adjusted_features
 
