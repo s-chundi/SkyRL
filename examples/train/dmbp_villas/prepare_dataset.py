@@ -18,7 +18,7 @@ from typing import Any, Iterable
 SCHEMA_VERSION = 1
 DATA_SOURCE = "dmbp_villas"
 DEFAULT_VALIDATION_FRACTION = 0.2
-WORKSPACE_INPUT_FILES = ("policy_constraints.md", "policy_dispatch.json")
+WORKSPACE_INPUT_FILES = ("intake_check.md", "policy_constraints.md", "policy_dispatch.json")
 
 
 class DatasetError(ValueError):

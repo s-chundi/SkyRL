@@ -42,7 +42,8 @@ def _make_run(runs_dir: Path, run_id: str, *, complete: bool = True) -> None:
     )
     (context / "workspace" / "policy_constraints.md").write_text("# Constraints\n", encoding="utf-8")
     (context / "workspace" / "findings").mkdir()
-    (context / "workspace" / "intake_check.md").write_text("ignored", encoding="utf-8")
+    (context / "workspace" / "intake_check.md").write_text("# Intake\n", encoding="utf-8")
+    (context / "workspace" / "pre_approval_report.md").write_text("ignored", encoding="utf-8")
 
     if complete:
         for category in categories:
@@ -82,6 +83,7 @@ def test_export_and_materialize_keep_ground_truth_hidden(tmp_path: Path) -> None
     exported_context = dataset_dir / "submissions" / "run-a" / "agent_context"
     assert sorted(path.name for path in exported_context.iterdir()) == ["application", "policies", "workspace"]
     assert sorted(path.name for path in (exported_context / "workspace").iterdir()) == [
+        "intake_check.md",
         "policy_constraints.md",
         "policy_dispatch.json",
     ]
@@ -91,6 +93,7 @@ def test_export_and_materialize_keep_ground_truth_hidden(tmp_path: Path) -> None
     materialize_runs(dataset_dir, materialized_dir)
     materialized_workspace = materialized_dir / "run-a" / "agent_context" / "workspace"
     assert sorted(path.name for path in materialized_workspace.iterdir()) == [
+        "intake_check.md",
         "policy_constraints.md",
         "policy_dispatch.json",
     ]
