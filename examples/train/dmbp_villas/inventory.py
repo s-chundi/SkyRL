@@ -5,8 +5,8 @@ files, exported contexts, labels, and teacher records) and writes:
 
 - ``inventory/submissions.csv``: one row per submission with duplicates, split,
   and context size and file counts;
-- ``inventory/episodes.csv``: one row per episode with teacher trace statistics
-  and label counts;
+- ``inventory/episodes.csv``: one row per episode with teacher trace statistics,
+  label counts, and how its leaf spec compares with the teacher's prompt;
 - ``inventory/labels.csv``: one row per (episode, rule key) teacher label;
 - ``inventory/rules.csv``: training-split verdict counts per rule key with
   sparse-rule flags;
@@ -16,6 +16,7 @@ files, exported contexts, labels, and teacher records) and writes:
 from __future__ import annotations
 
 import csv
+import difflib
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -57,6 +58,41 @@ def _table(headers: list[str], rows: list[list[Any]]) -> list[str]:
     lines = ["| " + " | ".join(headers) + " |", "|" + "|".join("---" for _ in headers) + "|"]
     lines += ["| " + " | ".join(str(cell) for cell in row) + " |" for row in rows]
     return lines + [""]
+
+
+def _teacher_instructions(invocation: dict[str, Any]) -> str:
+    """The subagent prompt from a teacher system prompt, without the SDK's appended notes."""
+    return invocation["system"][-1]["text"].split("\n\nNotes:\n", 1)[0]
+
+
+def _task_values(task: str) -> list[str]:
+    return [line.split(": ", 1)[-1] for line in task.splitlines()]
+
+
+def _compare_spec(spec: dict[str, Any] | None, teacher: dict[str, Any] | None) -> dict[str, Any]:
+    """Compare a leaf spec with the first teacher invocation; empty cells when either is missing."""
+    if spec is None or teacher is None:
+        return {
+            "spec_instructions_match": "",
+            "spec_instruction_diff_lines": "",
+            "spec_tools_match": "",
+            "spec_mcp_schemas_match": "",
+            "spec_task_values_match": "",
+        }
+    invocation = teacher["invocations"][0]
+    instructions = _teacher_instructions(invocation)
+    diff = difflib.unified_diff(spec["instructions"].splitlines(), instructions.splitlines(), lineterm="", n=0)
+    teacher_mcp = [tool for tool in invocation["tools"] if tool["name"].startswith("mcp__")]
+    return {
+        "spec_instructions_match": instructions == spec["instructions"],
+        "spec_instruction_diff_lines": sum(
+            1 for line in diff if line[:1] in "+-" and not line.startswith(("+++", "---"))
+        ),
+        "spec_tools_match": [tool["name"] for tool in invocation["tools"]] == spec["tools"],
+        "spec_mcp_schemas_match": teacher_mcp == spec["mcp_tools"],
+        "spec_task_values_match": _task_values(invocation["agent_tool_arguments"]["prompt"])
+        == _task_values(spec["task_prompt"]),
+    }
 
 
 def build_inventory(dataset_dir: Path) -> Path:
@@ -108,7 +144,9 @@ def build_inventory(dataset_dir: Path) -> Path:
                     "has_tooling_note": bool(rule.get("tooling_note")),
                 }
             )
-        stats = _read_json(dataset_dir / row["teacher_path"])["stats"] if row.get("teacher_path") else {}
+        teacher = _read_json(dataset_dir / row["teacher_path"]) if row.get("teacher_path") else None
+        spec = _read_json(dataset_dir / row["leaf_spec_path"]) if row.get("leaf_spec_path") else None
+        stats = teacher["stats"] if teacher else {}
         episode_rows.append(
             {
                 "episode_id": row["episode_id"],
@@ -128,6 +166,8 @@ def build_inventory(dataset_dir: Path) -> Path:
                 "max_prompt_tokens": stats.get("max_final_prompt_tokens", ""),
                 "finish_reason": stats.get("finish_reason", ""),
                 "wall_seconds": stats.get("wall_seconds", ""),
+                "has_leaf_spec": spec is not None,
+                **_compare_spec(spec, teacher),
             }
         )
 
@@ -263,6 +303,8 @@ def _render(
     if missing:
         lines += [f"Episodes without a teacher trace: {len(missing)}.", ""]
 
+    lines += _render_leaf_specs(manifest, episodes)
+
     lines += ["## Labels by category", ""]
     category_verdicts: dict[str, Counter[str]] = defaultdict(Counter)
     tooling_notes: Counter[str] = Counter()
@@ -310,3 +352,54 @@ def _render(
         ],
     )
     return "\n".join(lines)
+
+
+def _render_leaf_specs(manifest: dict[str, Any], episodes: list[dict[str, Any]]) -> list[str]:
+    with_spec = [episode for episode in episodes if episode["has_leaf_spec"]]
+    lines = ["## Leaf specs", ""]
+    if not with_spec:
+        return lines + ["No leaf specs rendered; run `prepare_dataset.py leaf-specs`.", ""]
+    for source in manifest.get("leaf_spec_sources", []):
+        lines.append(
+            "- Rendered from "
+            + ", ".join(
+                f"{part} `{state['path']}` at `{state['git_commit'][:10]}`"
+                + (" with uncommitted changes" if state["dirty"] else "")
+                for part, state in source.items()
+            )
+        )
+    compared = [episode for episode in with_spec if episode["spec_instructions_match"] != ""]
+    lines += [
+        "",
+        f"{len(with_spec)} episodes have a leaf spec; {len(compared)} also have a teacher trace and are compared "
+        "with the teacher's subagent prompt (system prompt without the SDK's notes), tool list, MCP tool schemas, "
+        "and the category, findings path, and intake path in its task message.",
+        "",
+    ]
+    by_category: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for episode in compared:
+        by_category[episode["category_id"]].append(episode)
+    lines += _table(
+        [
+            "Category",
+            "Episodes",
+            "Instructions identical",
+            "Max differing lines",
+            "Tools",
+            "MCP schemas",
+            "Task values",
+        ],
+        [
+            [
+                category,
+                len(items),
+                sum(item["spec_instructions_match"] for item in items),
+                max(item["spec_instruction_diff_lines"] for item in items),
+                sum(item["spec_tools_match"] for item in items),
+                sum(item["spec_mcp_schemas_match"] for item in items),
+                sum(item["spec_task_values_match"] for item in items),
+            ]
+            for category, items in sorted(by_category.items())
+        ],
+    )
+    return lines

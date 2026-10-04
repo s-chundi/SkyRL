@@ -1,4 +1,6 @@
+import csv
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -6,6 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import prepare_dataset
 from prepare_dataset import DatasetError, export_dataset, materialize_runs
 from teacher_trace import extract_subagents
 
@@ -307,3 +310,82 @@ def test_incomplete_run_requires_explicit_opt_in(tmp_path: Path) -> None:
     assert incomplete["status"] == "incomplete"
     assert incomplete["episode_count"] == 0
     assert incomplete["missing_ground_truth_categories"] == ["site-massing", "room-geometry"]
+
+
+def _fake_renderer(monkeypatch: pytest.MonkeyPatch, *, rule_key_suffix: str = "") -> None:
+    """Stand in for render_leaf_specs.py: write one spec per row from the row's own fields."""
+
+    def run(command, **_kwargs):
+        dataset_dir = Path(command[command.index("--dataset-dir") + 1])
+        for split in ("train", "validation"):
+            for line in (dataset_dir / f"{split}.jsonl").read_text(encoding="utf-8").splitlines():
+                row = json.loads(line)
+                category = {
+                    "category_id": row["category_id"],
+                    "rule_keys": [key + rule_key_suffix for key in row["rule_keys"]],
+                    "findings_path": row["findings_path"],
+                    "scratch_path": row["scratch_path"],
+                }
+                spec = {
+                    "source": {"content": {"path": "agent", "git_commit": "abc", "dirty": False}},
+                    "name": row["subagent_name"],
+                    "rulebook_id": row["rulebook_id"],
+                    "category": category,
+                    "instructions": "leaf",
+                    "task_prompt": f"Regulation category: {row['subagent_name']}",
+                    "tools": ["Read"],
+                    "mcp_tools": [],
+                }
+                path = dataset_dir / row["agent_context_path"] / ".." / "leaf_specs" / f"{row['subagent_name']}.json"
+                _write_json(path.resolve(), spec)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(prepare_dataset.subprocess, "run", run)
+
+
+def _fake_checkout(tmp_path: Path) -> Path:
+    checkout = tmp_path / "ips-applications"
+    project = checkout / "applications" / "permits-demo"
+    project.mkdir(parents=True)
+    (project / "pyproject.toml").write_text("", encoding="utf-8")
+    return checkout
+
+
+def test_leaf_specs_are_linked_and_compared_with_the_teacher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runs_dir = tmp_path / "runs"
+    _make_run(runs_dir, "run-a", traced_subagents=("site-massing",))
+    _make_run(runs_dir, "run-b")
+    _fake_renderer(monkeypatch)
+    dataset_dir = tmp_path / "dataset"
+
+    manifest = export_dataset(
+        runs_dir, dataset_dir, validation_submission_ids=["run-b"], ips_applications=_fake_checkout(tmp_path)
+    )
+
+    assert manifest["leaf_spec_sources"] == [{"content": {"path": "agent", "git_commit": "abc", "dirty": False}}]
+    rows = [json.loads(line) for line in (dataset_dir / "train.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["leaf_spec_path"] == "submissions/run-a/leaf_specs/site-massing.json"
+    with (dataset_dir / "inventory" / "episodes.csv").open(encoding="utf-8") as stream:
+        episodes = {row["episode_id"]: row for row in csv.DictReader(stream)}
+    compared = episodes["run-a:site-massing"]
+    assert compared["spec_instructions_match"] == "True"
+    assert compared["spec_tools_match"] == "True"
+    assert compared["spec_task_values_match"] == "True"
+    assert episodes["run-a:room-geometry"]["spec_instructions_match"] == ""
+    assert "## Leaf specs" in (dataset_dir / "inventory" / "README.md").read_text(encoding="utf-8")
+
+
+def test_leaf_spec_that_disagrees_with_its_row_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runs_dir = tmp_path / "runs"
+    _make_run(runs_dir, "run-a")
+    _make_run(runs_dir, "run-b")
+    _fake_renderer(monkeypatch, rule_key_suffix=".renamed")
+
+    with pytest.raises(DatasetError, match=r"Leaf spec mismatch.*rule_keys"):
+        export_dataset(
+            runs_dir,
+            tmp_path / "dataset",
+            validation_submission_ids=["run-b"],
+            ips_applications=_fake_checkout(tmp_path),
+        )
+    assert not (tmp_path / "dataset").exists()

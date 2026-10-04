@@ -1,31 +1,41 @@
 """Convert DMBP Villas run directories to and from a training dataset.
 
 The exported dataset keeps model-visible inputs under ``submissions/`` and
-ground truth and teacher traces beside, rather than inside, the agent context.
+ground truth, teacher traces, and leaf specs beside, rather than inside, the
+agent context.
 The workspace keeps only the read-only files staged before extraction starts.
 Each split file has one JSON object per submission and extraction subagent.
 
 A submission is one input snapshot (``metadata.json`` ``input_set_sha256``) and
-is named after its ``input_dir``, or after its run id when ``input_dir`` is null. When several runs share a snapshot, one run is
-exported and the others are recorded as duplicates.
+is named after its ``input_dir``, or after its run id when ``input_dir`` is null.
+When several runs share a snapshot, one run is exported and the others are
+recorded as duplicates.
+
+Leaf specs (the rendered instructions, task message, tools, and path scopes of
+each episode's subagent) come from the ips-applications loaders, so they are
+rendered in that checkout's environment by ``render_leaf_specs.py``.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, Iterable
 
 from inventory import build_inventory
 from teacher_trace import TraceError, extract_subagents
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DATA_SOURCE = "dmbp_villas"
 DEFAULT_VALIDATION_FRACTION = 0.2
 WORKSPACE_INPUT_FILES = ("intake_check.md", "policy_constraints.md", "policy_dispatch.json")
 TRACE_PATH = Path("agent_context") / "logs" / "trace.jsonl"
+PERMITS_PROJECT = Path("applications") / "permits-demo"
+RENDER_SCRIPT = Path(__file__).resolve().parent / "render_leaf_specs.py"
 
 
 class DatasetError(ValueError):
@@ -246,8 +256,12 @@ def export_dataset(
     run_ids: list[str] | None = None,
     validation_submission_ids: list[str] | None = None,
     allow_incomplete: bool = False,
+    ips_applications: Path | None = None,
 ) -> dict[str, Any]:
-    """Export run directories into clean contexts, hidden labels and teacher traces, and JSONL splits."""
+    """Export run directories into clean contexts, hidden labels and teacher traces, and JSONL splits.
+
+    With ``ips_applications``, also render each episode's leaf spec from that checkout.
+    """
     runs = _deduplicate([_load_run(context) for context in _discover_contexts(runs_dir, run_ids)])
     submission_ids = [run["submission_id"] for run in runs]
     validation_ids = _choose_validation_ids(submission_ids, validation_submission_ids)
@@ -325,6 +339,7 @@ def export_dataset(
                         "agent_context_path": exported_context.relative_to(output_dir).as_posix(),
                         "ground_truth_path": label_path.relative_to(output_dir).as_posix(),
                         "teacher_path": teacher_path,
+                        "leaf_spec_path": None,
                         "findings_path": category.get("findings_path"),
                         "scratch_path": category.get("scratch_path"),
                     }
@@ -367,12 +382,54 @@ def export_dataset(
             "submissions": submissions,
         }
         _write_json(output_dir / "dataset.json", manifest)
+        if ips_applications is not None:
+            return add_leaf_specs(output_dir, ips_applications)
         validate_dataset(output_dir)
         build_inventory(output_dir)
         return manifest
     except Exception:
         shutil.rmtree(output_dir, ignore_errors=True)
         raise
+
+
+def add_leaf_specs(dataset_dir: Path, ips_applications: Path) -> dict[str, Any]:
+    """Render every episode's leaf spec with the ips-applications loaders and link it from its row."""
+    project = (ips_applications / PERMITS_PROJECT).resolve()
+    if not (project / "pyproject.toml").is_file():
+        raise DatasetError(f"Not an ips-applications checkout: {ips_applications}")
+    env = {
+        **os.environ,
+        "PERMITS_USE_CASE_PACKAGE": "services.permits",
+        "PYTHONPATH": str(project),
+        "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+    }
+    command = ["uv", "run", "--no-sync", "--project", str(project), "python", str(RENDER_SCRIPT)]
+    result = subprocess.run(
+        [*command, "--dataset-dir", str(dataset_dir.resolve())],
+        cwd=project,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise DatasetError(f"Rendering leaf specs failed:\n{result.stderr[-4000:]}")
+
+    manifest = _read_json(dataset_dir / "dataset.json")
+    sources = set()
+    for split in ("train", "validation"):
+        rows = _read_jsonl(dataset_dir / f"{split}.jsonl")
+        for row in rows:
+            spec_path = Path(row["agent_context_path"]).parent / "leaf_specs" / f"{row['subagent_name']}.json"
+            if not (dataset_dir / spec_path).is_file():
+                raise DatasetError(f"No leaf spec was rendered for {row['episode_id']}")
+            row["leaf_spec_path"] = spec_path.as_posix()
+            sources.add(json.dumps(_read_json(dataset_dir / spec_path)["source"], sort_keys=True))
+        _write_jsonl(dataset_dir / f"{split}.jsonl", rows)
+    manifest["leaf_spec_sources"] = [json.loads(source) for source in sorted(sources)]
+    _write_json(dataset_dir / "dataset.json", manifest)
+    validate_dataset(dataset_dir)
+    build_inventory(dataset_dir)
+    return manifest
 
 
 def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
@@ -433,10 +490,28 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
             teacher = _read_json(dataset_dir / row["teacher_path"])
             if teacher.get("subagent_name") != row.get("subagent_name") or teacher.get("run_id") != row.get("run_id"):
                 raise DatasetError(f"Teacher trace mismatch in row {row.get('episode_id')}")
+        if row.get("leaf_spec_path") is not None:
+            _validate_leaf_spec(row, _read_json(dataset_dir / row["leaf_spec_path"]))
 
     if manifest.get("episode_count") != len(all_rows):
         raise DatasetError("dataset.json episode_count does not match split files")
     return manifest
+
+
+def _validate_leaf_spec(row: dict[str, Any], spec: dict[str, Any]) -> None:
+    category = spec.get("category") or {}
+    expected = {
+        "name": row.get("subagent_name"),
+        "rulebook_id": row.get("rulebook_id"),
+        "category_id": row.get("category_id"),
+        "rule_keys": row.get("rule_keys"),
+        "findings_path": row.get("findings_path"),
+        "scratch_path": row.get("scratch_path"),
+    }
+    actual = {key: spec.get(key) if key in ("name", "rulebook_id") else category.get(key) for key in expected}
+    mismatched = sorted(key for key in expected if actual[key] != expected[key])
+    if mismatched:
+        raise DatasetError(f"Leaf spec mismatch in row {row.get('episode_id')}: {mismatched}")
 
 
 def materialize_runs(
@@ -485,6 +560,13 @@ def _build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--run-id", action="append", dest="run_ids")
     export_parser.add_argument("--validation-submission-id", action="append", dest="validation_submission_ids")
     export_parser.add_argument("--allow-incomplete", action="store_true")
+    export_parser.add_argument(
+        "--ips-applications", type=Path, help="Render leaf specs with this ips-applications checkout"
+    )
+
+    leaf_spec_parser = subparsers.add_parser("leaf-specs", help="Render leaf specs for an exported dataset")
+    leaf_spec_parser.add_argument("--dataset-dir", type=Path, required=True)
+    leaf_spec_parser.add_argument("--ips-applications", type=Path, required=True)
 
     materialize_parser = subparsers.add_parser(
         "materialize", help="Convert the dataset format to clean run directories"
@@ -511,11 +593,15 @@ def main() -> None:
                 run_ids=args.run_ids,
                 validation_submission_ids=args.validation_submission_ids,
                 allow_incomplete=args.allow_incomplete,
+                ips_applications=args.ips_applications,
             )
             print(
                 f"Exported {manifest['episode_count']} episodes from "
                 f"{manifest['submission_count']} submissions to {args.output_dir}"
             )
+        elif args.command == "leaf-specs":
+            manifest = add_leaf_specs(args.dataset_dir, args.ips_applications)
+            print(f"Rendered leaf specs for {manifest['episode_count']} episodes in {args.dataset_dir}")
         elif args.command == "materialize":
             materialize_runs(
                 args.dataset_dir,
