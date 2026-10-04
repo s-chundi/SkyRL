@@ -1,9 +1,13 @@
 """Convert DMBP Villas run directories to and from a training dataset.
 
 The exported dataset keeps model-visible inputs under ``submissions/`` and
-ground truth beside, rather than inside, the agent context. The workspace keeps
-only the read-only files staged before extraction starts. Each split file has
-one JSON object per submission and extraction subagent.
+ground truth and teacher traces beside, rather than inside, the agent context.
+The workspace keeps only the read-only files staged before extraction starts.
+Each split file has one JSON object per submission and extraction subagent.
+
+A submission is one input snapshot (``metadata.json`` ``input_set_sha256``) and
+is named after its ``input_dir``, or after its run id when ``input_dir`` is null. When several runs share a snapshot, one run is
+exported and the others are recorded as duplicates.
 """
 
 from __future__ import annotations
@@ -14,11 +18,14 @@ import shutil
 from pathlib import Path
 from typing import Any, Iterable
 
+from inventory import build_inventory
+from teacher_trace import TraceError, extract_subagents
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DATA_SOURCE = "dmbp_villas"
 DEFAULT_VALIDATION_FRACTION = 0.2
 WORKSPACE_INPUT_FILES = ("intake_check.md", "policy_constraints.md", "policy_dispatch.json")
+TRACE_PATH = Path("agent_context") / "logs" / "trace.jsonl"
 
 
 class DatasetError(ValueError):
@@ -94,20 +101,72 @@ def _discover_contexts(runs_dir: Path, run_ids: list[str] | None) -> list[Path]:
     return sorted(contexts, key=lambda path: path.parent.name)
 
 
-def _choose_validation_ids(run_ids: list[str], requested: list[str] | None) -> set[str]:
+def _choose_validation_ids(submission_ids: list[str], requested: list[str] | None) -> set[str]:
     if requested:
-        validation_ids = {_safe_name(run_id, "validation run id") for run_id in requested}
-        unknown = validation_ids.difference(run_ids)
+        validation_ids = {_safe_name(submission_id, "validation submission id") for submission_id in requested}
+        unknown = validation_ids.difference(submission_ids)
         if unknown:
-            raise DatasetError(f"Validation run ids were not selected for export: {sorted(unknown)}")
-        if len(validation_ids) == len(run_ids):
+            raise DatasetError(f"Validation submission ids were not selected for export: {sorted(unknown)}")
+        if len(validation_ids) == len(submission_ids):
             raise DatasetError("The training split would be empty")
         return validation_ids
 
-    validation_count = max(1, round(len(run_ids) * DEFAULT_VALIDATION_FRACTION))
-    if validation_count == len(run_ids):
-        raise DatasetError("At least two runs are required to create train and validation splits")
-    return set(sorted(run_ids)[-validation_count:])
+    validation_count = max(1, round(len(submission_ids) * DEFAULT_VALIDATION_FRACTION))
+    if validation_count == len(submission_ids):
+        raise DatasetError("At least two submissions are required to create train and validation splits")
+    return set(sorted(submission_ids)[-validation_count:])
+
+
+def _load_run(context: Path) -> dict[str, Any]:
+    run_dir = context.parent
+    run_id = _safe_name(run_dir.name, "run id")
+    metadata = _read_json(run_dir / "metadata.json")
+    if not metadata.get("input_set_sha256"):
+        raise DatasetError(f"Run {run_id} has no input_set_sha256 in metadata.json; it cannot be deduplicated")
+    input_dir = metadata.get("input_dir")
+    submission_id = _safe_name(Path(input_dir).name, "submission id") if input_dir else run_id
+    dispatch, categories = _load_categories(context)
+    ground_truth = _load_ground_truth(context)
+    unexpected = sorted(set(ground_truth).difference(category["category_id"] for category in categories))
+    if unexpected:
+        raise DatasetError(f"Unexpected ground-truth categories for run {run_id}: {unexpected}")
+    trace_path = run_dir / TRACE_PATH
+    return {
+        "run_id": run_id,
+        "context": context,
+        "submission_id": submission_id,
+        "input_dir": input_dir,
+        "input_set_sha256": metadata.get("input_set_sha256"),
+        "dispatch": dispatch,
+        "categories": categories,
+        "ground_truth": ground_truth,
+        "missing_categories": [c["category_id"] for c in categories if c["category_id"] not in ground_truth],
+        "trace_path": trace_path if trace_path.is_file() else None,
+    }
+
+
+def _deduplicate(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one run per input snapshot: labeled, then traced, then smallest run id."""
+    by_snapshot: dict[str, list[dict[str, Any]]] = {}
+    for run in runs:
+        by_snapshot.setdefault(run["input_set_sha256"], []).append(run)
+
+    selected = []
+    for group in by_snapshot.values():
+        group.sort(key=lambda run: (bool(run["missing_categories"]), run["trace_path"] is None, run["run_id"]))
+        chosen = {**group[0], "duplicate_run_ids": [run["run_id"] for run in group[1:]]}
+        selected.append(chosen)
+
+    by_submission: dict[str, list[str]] = {}
+    for run in selected:
+        by_submission.setdefault(run["submission_id"], []).append(run["run_id"])
+    conflicts = {submission: ids for submission, ids in by_submission.items() if len(ids) > 1}
+    if conflicts:
+        raise DatasetError(
+            f"Runs share an input_dir but have different input_set_sha256 values: {conflicts}. "
+            "Select one snapshot per submission with --run-id."
+        )
+    return sorted(selected, key=lambda run: run["submission_id"])
 
 
 def _copy_workspace_inputs(source_workspace: Path, output_workspace: Path) -> None:
@@ -162,9 +221,7 @@ def _load_ground_truth(context: Path) -> dict[str, tuple[Path, dict[str, Any]]]:
     return ground_truth
 
 
-def _validate_ground_truth(
-    category: dict[str, Any], source_path: Path, ground_truth: dict[str, Any]
-) -> None:
+def _validate_ground_truth(category: dict[str, Any], source_path: Path, ground_truth: dict[str, Any]) -> None:
     category_id = category["category_id"]
     if ground_truth.get("position") != category.get("position"):
         raise DatasetError(f"Position mismatch for {category_id!r} in {source_path}")
@@ -179,9 +236,7 @@ def _validate_ground_truth(
     if len(actual_rule_keys) != len(rules) or set(actual_rule_keys) != set(expected_rule_keys):
         missing = sorted(set(expected_rule_keys).difference(actual_rule_keys))
         extra = sorted(set(actual_rule_keys).difference(expected_rule_keys))
-        raise DatasetError(
-            f"Rule mismatch for {category_id!r} in {source_path}; missing={missing}, extra={extra}"
-        )
+        raise DatasetError(f"Rule mismatch for {category_id!r} in {source_path}; missing={missing}, extra={extra}")
 
 
 def export_dataset(
@@ -189,38 +244,32 @@ def export_dataset(
     output_dir: Path,
     *,
     run_ids: list[str] | None = None,
-    validation_run_ids: list[str] | None = None,
+    validation_submission_ids: list[str] | None = None,
     allow_incomplete: bool = False,
 ) -> dict[str, Any]:
-    """Export run directories into clean contexts, hidden labels, and JSONL splits."""
-    contexts = _discover_contexts(runs_dir, run_ids)
-    selected_ids = [context.parent.name for context in contexts]
-    validation_ids = _choose_validation_ids(selected_ids, validation_run_ids)
+    """Export run directories into clean contexts, hidden labels and teacher traces, and JSONL splits."""
+    runs = _deduplicate([_load_run(context) for context in _discover_contexts(runs_dir, run_ids)])
+    submission_ids = [run["submission_id"] for run in runs]
+    validation_ids = _choose_validation_ids(submission_ids, validation_submission_ids)
+    incomplete = {run["submission_id"]: run["missing_categories"] for run in runs if run["missing_categories"]}
+    if incomplete and not allow_incomplete:
+        raise DatasetError(
+            f"Missing ground truth: {incomplete}. Use --allow-incomplete to inventory these runs without training rows."
+        )
     _require_new_directory(output_dir)
 
     rows_by_split: dict[str, list[dict[str, Any]]] = {"train": [], "validation": []}
     submissions = []
 
     try:
-        for context in contexts:
-            submission_id = _safe_name(context.parent.name, "submission id")
+        for run in runs:
+            submission_id = run["submission_id"]
             split = "validation" if submission_id in validation_ids else "train"
-            dispatch, categories = _load_categories(context)
-            ground_truth = _load_ground_truth(context)
-
-            expected_category_ids = {category["category_id"] for category in categories}
-            unexpected = sorted(set(ground_truth).difference(expected_category_ids))
-            if unexpected:
-                raise DatasetError(f"Unexpected ground-truth categories for {submission_id}: {unexpected}")
-
-            missing_categories = [
-                category["category_id"] for category in categories if category["category_id"] not in ground_truth
-            ]
-            if missing_categories and not allow_incomplete:
-                raise DatasetError(
-                    f"Missing ground truth for {submission_id}: {missing_categories}. "
-                    "Use --allow-incomplete to inventory the run without training rows."
-                )
+            context = run["context"]
+            try:
+                teacher = extract_subagents(run["trace_path"], run["run_id"]) if run["trace_path"] else {}
+            except TraceError as exc:
+                raise DatasetError(f"Cannot read teacher trace for run {run['run_id']}: {exc}") from exc
 
             submission_dir = output_dir / "submissions" / submission_id
             exported_context = submission_dir / "agent_context"
@@ -233,19 +282,31 @@ def export_dataset(
 
             ground_truth_dir = submission_dir / "ground_truth"
             ground_truth_dir.mkdir()
+            teacher_dir = submission_dir / "teacher"
             exported_count = 0
-            for category in categories:
+            missing_teacher = []
+            excluded = []
+            for category in run["categories"]:
                 category_id = category["category_id"]
-                if category_id not in ground_truth:
+                if category_id not in run["ground_truth"]:
                     continue
-                source_path, label = ground_truth[category_id]
+                source_path, label = run["ground_truth"][category_id]
                 _validate_ground_truth(category, source_path, label)
 
                 subagent_name = category["extraction_agent"]
+                invocations = teacher.get(subagent_name, {}).get("stats", {}).get("invocations", 1)
+                if invocations > 1:
+                    # The re-launched session starts from the first session's findings file, unlike an episode.
+                    excluded.append({"subagent_name": subagent_name, "reason": f"teacher invoked {invocations} times"})
+                    continue
                 label_path = ground_truth_dir / f"{subagent_name}.json"
                 _write_json(label_path, label)
-                relative_context = exported_context.relative_to(output_dir).as_posix()
-                relative_label = label_path.relative_to(output_dir).as_posix()
+                teacher_path = None
+                if subagent_name in teacher:
+                    teacher_path = (teacher_dir / f"{subagent_name}.json").relative_to(output_dir).as_posix()
+                    _write_json(output_dir / teacher_path, teacher[subagent_name])
+                else:
+                    missing_teacher.append(subagent_name)
                 rows_by_split[split].append(
                     {
                         "schema_version": SCHEMA_VERSION,
@@ -253,15 +314,17 @@ def export_dataset(
                         "env_class": DATA_SOURCE,
                         "episode_id": f"{submission_id}:{subagent_name}",
                         "submission_id": submission_id,
+                        "run_id": run["run_id"],
                         "split": split,
                         "subagent_name": subagent_name,
                         "category_id": category_id,
                         "category_name": category.get("name"),
                         "position": category.get("position"),
-                        "rulebook_id": dispatch.get("rulebook_id"),
+                        "rulebook_id": run["dispatch"].get("rulebook_id"),
                         "rule_keys": category["rule_keys"],
-                        "agent_context_path": relative_context,
-                        "ground_truth_path": relative_label,
+                        "agent_context_path": exported_context.relative_to(output_dir).as_posix(),
+                        "ground_truth_path": label_path.relative_to(output_dir).as_posix(),
+                        "teacher_path": teacher_path,
                         "findings_path": category.get("findings_path"),
                         "scratch_path": category.get("scratch_path"),
                     }
@@ -271,12 +334,19 @@ def export_dataset(
             submissions.append(
                 {
                     "submission_id": submission_id,
+                    "run_id": run["run_id"],
+                    "duplicate_run_ids": run["duplicate_run_ids"],
+                    "input_dir": run["input_dir"],
+                    "input_set_sha256": run["input_set_sha256"],
                     "split": split,
-                    "status": "ready" if not missing_categories else "incomplete",
+                    "status": "ready" if not run["missing_categories"] else "incomplete",
                     "agent_context_path": exported_context.relative_to(output_dir).as_posix(),
                     "ground_truth_dir": ground_truth_dir.relative_to(output_dir).as_posix(),
+                    "has_trace": run["trace_path"] is not None,
                     "episode_count": exported_count,
-                    "missing_ground_truth_categories": missing_categories,
+                    "missing_ground_truth_categories": run["missing_categories"],
+                    "missing_teacher_subagents": missing_teacher,
+                    "excluded_episodes": excluded,
                 }
             )
 
@@ -289,7 +359,7 @@ def export_dataset(
             "dataset_name": DATA_SOURCE,
             "source_runs_dir": str(runs_dir.resolve()),
             "splits": {
-                "train": sorted(set(selected_ids).difference(validation_ids)),
+                "train": sorted(set(submission_ids).difference(validation_ids)),
                 "validation": sorted(validation_ids),
             },
             "submission_count": len(submissions),
@@ -298,6 +368,7 @@ def export_dataset(
         }
         _write_json(output_dir / "dataset.json", manifest)
         validate_dataset(output_dir)
+        build_inventory(output_dir)
         return manifest
     except Exception:
         shutil.rmtree(output_dir, ignore_errors=True)
@@ -358,6 +429,10 @@ def validate_dataset(dataset_dir: Path) -> dict[str, Any]:
         label = _read_json(label_path)
         if label.get("category_id") != row.get("category_id"):
             raise DatasetError(f"Ground-truth category mismatch in row {row.get('episode_id')}")
+        if row.get("teacher_path") is not None:
+            teacher = _read_json(dataset_dir / row["teacher_path"])
+            if teacher.get("subagent_name") != row.get("subagent_name") or teacher.get("run_id") != row.get("run_id"):
+                raise DatasetError(f"Teacher trace mismatch in row {row.get('episode_id')}")
 
     if manifest.get("episode_count") != len(all_rows):
         raise DatasetError("dataset.json episode_count does not match split files")
@@ -408,7 +483,7 @@ def _build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--runs-dir", type=Path, required=True)
     export_parser.add_argument("--output-dir", type=Path, required=True)
     export_parser.add_argument("--run-id", action="append", dest="run_ids")
-    export_parser.add_argument("--validation-run-id", action="append", dest="validation_run_ids")
+    export_parser.add_argument("--validation-submission-id", action="append", dest="validation_submission_ids")
     export_parser.add_argument("--allow-incomplete", action="store_true")
 
     materialize_parser = subparsers.add_parser(
@@ -420,6 +495,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     validate_parser = subparsers.add_parser("validate", help="Validate an exported dataset")
     validate_parser.add_argument("--dataset-dir", type=Path, required=True)
+
+    inventory_parser = subparsers.add_parser("inventory", help="Regenerate inventory tables for an exported dataset")
+    inventory_parser.add_argument("--dataset-dir", type=Path, required=True)
     return parser
 
 
@@ -431,7 +509,7 @@ def main() -> None:
                 args.runs_dir,
                 args.output_dir,
                 run_ids=args.run_ids,
-                validation_run_ids=args.validation_run_ids,
+                validation_submission_ids=args.validation_submission_ids,
                 allow_incomplete=args.allow_incomplete,
             )
             print(
@@ -445,6 +523,10 @@ def main() -> None:
                 restore_ground_truth=args.restore_ground_truth,
             )
             print(f"Materialized run directories at {args.output_runs_dir}")
+        elif args.command == "inventory":
+            validate_dataset(args.dataset_dir)
+            report = build_inventory(args.dataset_dir)
+            print(f"Wrote inventory to {report.parent}")
         else:
             manifest = validate_dataset(args.dataset_dir)
             print(
